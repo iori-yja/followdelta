@@ -4,18 +4,17 @@ import (
 	"bytes"
 	"encoding/binary"
 	"encoding/json"
-	"sort"
-	"log"
-	"fmt"
-	"net/http"
 	"flag"
-	"time"
-	"io"
-	"io/ioutil"
-	"os"
-	"strings"
+	"fmt"
 	"github.com/kurrik/oauth1a"
 	"github.com/kurrik/twittergo"
+	"io"
+	"io/ioutil"
+	"log"
+	"net/http"
+	"os"
+	"strings"
+	"time"
 
 	bolt "go.etcd.io/bbolt"
 )
@@ -30,7 +29,7 @@ func ParseConfig(fname string) (*twittergo.Client, error) {
 		return nil, err
 	}
 	config := oauth1a.ClientConfig{
-		ConsumerKey: conf["consumer_key"],
+		ConsumerKey:    conf["consumer_key"],
 		ConsumerSecret: conf["consumer_secret"],
 	}
 	user := oauth1a.NewAuthorizedConfig(conf["access_token"], conf["access_token_secret"])
@@ -40,12 +39,12 @@ func ParseConfig(fname string) (*twittergo.Client, error) {
 
 func UserInfo(client *twittergo.Client, ids []uint64) (map[uint64]Description, error) {
 	ret := make(map[uint64]Description, len(ids))
-	for i, next := 0, 100; i < len(ids); i, next = next, next + 100 {
+	for i, next := 0, 100; i < len(ids); i, next = next, next+100 {
 		if next > len(ids) {
 			next = len(ids)
 		}
 		// ids for check
-		cids := ids[i:next-1]
+		cids := ids[i : next-1]
 		q := ""
 		for _, id := range cids {
 			q = fmt.Sprintf("%s%d,", q, id)
@@ -53,22 +52,19 @@ func UserInfo(client *twittergo.Client, ids []uint64) (map[uint64]Description, e
 		q = strings.TrimRight(q, ",")
 		req, err := http.NewRequest("GET", fmt.Sprintf("/1.1/users/lookup.json?user_id=%s", q), nil)
 		if err != nil {
-			log.Printf("req failed")
-			return nil, err
+			return nil, fmt.Errorf("failed to create a request", err.Error())
 		}
 		resp, err := client.SendRequest(req)
 		if err != nil {
-			log.Printf("resp failed")
-			return nil, err
+			return nil, fmt.Errorf("request failed: %s with %v", err.Error(), cids)
 		}
 		var user []twittergo.User
 		if err := resp.Parse(&user); err != nil {
-			log.Printf("parse failed")
-			return nil, err
+			return nil, fmt.Errorf("parse failed: %s", err.Error())
 		}
 		for _, u := range user {
 			ret[u.Id()] = Description{
-				Name: u.Name(),
+				Name:       u.Name(),
 				ScreenName: u.ScreenName(),
 			}
 		}
@@ -78,7 +74,7 @@ func UserInfo(client *twittergo.Client, ids []uint64) (map[uint64]Description, e
 
 type FollowIds struct {
 	Ids        []uint64 `json:"ids"`
-	NextCursor int     `json:"next_cursor"`
+	NextCursor int      `json:"next_cursor"`
 }
 
 func GetFollowIds(client *twittergo.Client, cur int) (FollowIds, error) {
@@ -197,34 +193,6 @@ func DeleteFollowers(db *bolt.DB, bname string, keys []uint64) error {
 	})
 }
 
-func Diff(cur, prev []uint64) ([]uint64, []uint64) {
-	// small comes first
-	sort.Slice(cur, func(i, j int) bool {return cur[i] < cur[j]})
-	sort.Slice(prev, func(i, j int) bool {return prev[i] < prev[j]})
-
-	newbies, traitors := make([]uint64, 0), make([]uint64, 0)
-	i, j := 0, 0
-	for ; i < len(cur) && j < len(prev); {
-		if cur[i] == prev[j] {
-			// She remains; skip
-			i, j = i+1, j+1
-		} else if cur[i] > prev[j] {
-			// prev[j] didn't appear in cur
-			traitors = append(traitors, prev[j])
-			j = j+1
-		} else {
-			// cur[i] didn't appear in prev, so she is newcomer
-			log.Printf("%d(%d) vs %d(%d)", cur[i], i, prev[j], j)
-			newbies = append(newbies, cur[i])
-			i = i+1
-		}
-	}
-	// remaining currents are all newbies... am I right?
-	newbies = append(newbies, cur[i:]...)
-	traitors = append(traitors, prev[j:]...)
-	return newbies, traitors
-}
-
 func Index(client *twittergo.Client, db *bolt.DB) error {
 	intoSlice := func(m map[uint64]Description) []uint64 {
 		r := make([]uint64, 0, len(m))
@@ -238,57 +206,56 @@ func Index(client *twittergo.Client, db *bolt.DB) error {
 		fmt.Printf("{\"%s\": %s}\n", label, str)
 	}
 
-	cur, err := GetAllFollowers(client)
-	if err != nil {
-		return fmt.Errorf("Failed to get current followers: %s", err.Error())
-	}
 	prevDescs, err := ReadPreviousFollowers(db, "active")
 	if err != nil {
 		return fmt.Errorf("Failed to get previous followers: %s", err.Error())
 	}
-	n, t := Diff(cur, intoSlice(prevDescs))
 
-	// Update the database
+	cur, err := GetAllFollowers(client)
+	if err != nil {
+		return fmt.Errorf("Failed to get current followers: %s", err.Error())
+	}
 	ts := time.Now().Format("2006-01-02:03:04:05")
 	curDescs, err := UserInfo(client, cur)
 	if err != nil {
 		return fmt.Errorf("Failed to describe current followers: %s", err.Error())
 	}
 
+	newbies := make(map[uint64]Description)
 	for k, v := range curDescs {
+		v.LastSeen = ts
 		if _, ok := prevDescs[k]; !ok {
 			v.FirstSeen = ts
+			newbies[k] = v
 		}
-		v.LastSeen = ts
 		curDescs[k] = v
 	}
+	report("newbies", newbies)
+
+	traitors := make(map[uint64]Description)
+	for k, v := range prevDescs {
+		if _, ok := curDescs[k]; !ok {
+			traitors[k] = v
+		}
+	}
+	report("traitors", traitors)
+	fmt.Printf("{\"delta\": %d}", len(curDescs)-len(prevDescs))
 
 	if err := WriteFollowers(db, "active", curDescs); err != nil {
 		log.Printf("Write error: %s", err.Error())
 	}
-	if err := DeleteFollowers(db, "active", t); err != nil {
+	if err := DeleteFollowers(db, "active", intoSlice(traitors)); err != nil {
 		log.Printf("Delete error: %s", err.Error())
-	}
-	traitors := make(map[uint64]Description, len(t))
-	for _, k := range t {
-		traitors[k] = prevDescs[k]
 	}
 	if err := WriteFollowers(db, "graveyard", traitors); err != nil {
 		log.Printf("Write graves error: %s", err.Error())
 	}
 
-	newbies := make(map[uint64]Description, len(n))
-	for _, k := range n {
-		newbies[k] = curDescs[k]
-	}
-	report("newbies", newbies)
-	report("traitors", traitors)
-	fmt.Printf("delta: %d", len(cur) - len(prevDescs))
 	return err
 }
 
 func main() {
-	confFile := flag.String("conf", "", "configuration file")
+	confFile := flag.String("conf", "conf.json", "configuration file")
 	dbFile := flag.String("db", "db.bolt", "db file (bolt)")
 	readDb := flag.Bool("read", false, "only read db")
 	grave := flag.Bool("grave", false, "only show graveyard db")
